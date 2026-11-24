@@ -1,0 +1,9 @@
+# 依赖与构建缓存
+node_modules/
+*.log
+
+# macOS
+.DS_Store
+
+# 本地验证产物
+/verify-logs/

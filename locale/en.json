@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Shift+Enter to send",
+    "description": "Makes Shift+Enter submit a message and plain Enter break the line in every conversation composer. Needs the DSH patch shipped in the repository; without it the default gesture stays and this plugin does nothing.",
+    "detail": "docs/DETAIL.md"
+  }
+}

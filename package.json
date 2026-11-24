@@ -1,0 +1,53 @@
+{
+  "name": "dsh-shift-enter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "让 DeepSeek Harness Web 输入框改用 Shift+Enter 发送、Enter 换行，避免误触发送。",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node --test test/plugin.test.mjs"
+  },
+  "license": "GPL-3.0-or-later",
+  "author": "amonisachicken",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amonisachicken/dsh-shift-enter.git"
+  },
+  "homepage": "https://github.com/amonisachicken/dsh-shift-enter#readme",
+  "bugs": {
+    "url": "https://github.com/amonisachicken/dsh-shift-enter/issues"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "keyboard",
+    "shift-enter",
+    "composer"
+  ]
+}

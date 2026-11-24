@@ -1,0 +1,428 @@
+diff --git a/packages/client/ui-conversation/src/client/apply.ts b/packages/client/ui-conversation/src/client/apply.ts
+index 4f292f0ece..0812feeb07 100644
+--- a/packages/client/ui-conversation/src/client/apply.ts
++++ b/packages/client/ui-conversation/src/client/apply.ts
+@@ -14,7 +14,8 @@ import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+ import type {} from '@deepseek-ai/dsh-client-ui-session/client'
+ import type {} from '@deepseek-ai/dsh-client-ui-session-status/client'
+ import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
+-import type { ShortcutCommandId, ShortcutFixedCommand } from '@deepseek-ai/dsh-client-shortcuts/client'
++import type { ShortcutBinding, ShortcutCommandId, ShortcutFixedCommand } from '@deepseek-ai/dsh-client-shortcuts/client'
++import type { ComposerSendGesture } from './send-gesture.ts'
+ import { UiConversation } from './conversation/assembly.ts'
+ import { UserText, PlainUserText, SessionReference } from './user-text/UserText.tsx'
+ import { sessionReferenceRule } from './user-text/session-reference-rule.ts'
+@@ -274,12 +275,21 @@ export function apply(ctx: Context, config: Config = Config({})): void {
+   }
+   const stopShortcut = createSnapshotStore<readonly string[]>([])
+   ctx.inject(['shortcuts'], (scope) => {
++    // The send/newline rows follow the live Enter policy: a profile plugin can
++    // move submitting to Shift+Enter, so both rows re-register on a change.
++    const enterRows = (gesture: ComposerSendGesture): readonly ShortcutFixedCommand[] => {
++      const submit: ShortcutBinding['modifiers'] = gesture === 'enter' ? [] : ['shift']
++      const newline: ShortcutBinding['modifiers'] = gesture === 'enter' ? ['shift'] : []
++      return [
++        { id: 'fixed.send' as ShortcutCommandId, label: () => t('input.send'),
++          keys: scope.shortcuts.describeBinding({ code: 'Enter', modifiers: submit }).keys,
++          bindings: [{ code: 'Enter', modifiers: submit }], group: 'input' },
++        { id: 'fixed.newline' as ShortcutCommandId, label: () => t('shortcut.newline'),
++          keys: scope.shortcuts.describeBinding({ code: 'Enter', modifiers: newline }).keys,
++          bindings: [{ code: 'Enter', modifiers: newline }], group: 'input' },
++      ]
++    }
+     const fixedInputs: readonly ShortcutFixedCommand[] = [
+-      { id: 'fixed.send' as ShortcutCommandId, label: () => t('input.send'), keys: ['Enter'],
+-        bindings: [{ code: 'Enter', modifiers: [] }], group: 'input' },
+-      { id: 'fixed.newline' as ShortcutCommandId, label: () => t('shortcut.newline'),
+-        keys: scope.shortcuts.describeBinding({ code: 'Enter', modifiers: ['shift'] }).keys,
+-        bindings: [{ code: 'Enter', modifiers: ['shift'] }], group: 'input' },
+       { id: 'fixed.complementary' as ShortcutCommandId, label: () => t('shortcut.complementary'),
+         keys: scope.shortcuts.describeBinding({ code: 'Enter', modifiers: ['primary'] }).keys,
+         bindings: [{ code: 'Enter', modifiers: ['control'] }, { code: 'Enter', modifiers: ['meta'] }], group: 'input' },
+@@ -291,6 +301,23 @@ export function apply(ctx: Context, config: Config = Config({})): void {
+     for (const command of fixedInputs) {
+       scope.effect(() => scope.shortcuts.registerFixed(command), `ui-conversation: ${command.id}`)
+     }
++    scope.effect(() => {
++      let shown: ComposerSendGesture | undefined
++      let disposers: readonly (() => void)[] = []
++      const sync = (): void => {
++        const gesture = uiConversation.composerSendGesture.getSnapshot()
++        if (gesture === shown) return
++        shown = gesture
++        for (const dispose of disposers) dispose()
++        disposers = enterRows(gesture).map(command => scope.shortcuts.registerFixed(command))
++      }
++      sync()
++      const unsubscribe = uiConversation.composerSendGesture.subscribe(sync)
++      return () => {
++        unsubscribe()
++        for (const dispose of disposers) dispose()
++      }
++    }, 'ui-conversation: fixed send input')
+     scope.effect(() => installStopShortcut(
+       scope.shortcuts, sessions, binding => uiConversation.binding(binding).openTurn, ctx.uiSession, stop,
+     ), 'ui-conversation: fixed stop input')
+@@ -304,7 +331,7 @@ export function apply(ctx: Context, config: Config = Config({})): void {
+     }, 'ui-conversation: fixed stop reference')
+   })
+ 
+-  const inputHub = new InputHub(ctx, t)
++  const inputHub = new InputHub(ctx, t, () => uiConversation.composerSendGesture.getSnapshot())
+   const composerBlocks = new ComposerBlockRegistry()
+ 
+   ctx.inject(['commandUi'], (scope) => {
+diff --git a/packages/client/ui-conversation/src/client/contract/draft-editor.ts b/packages/client/ui-conversation/src/client/contract/draft-editor.ts
+index 86592a82db..b0419157a5 100644
+--- a/packages/client/ui-conversation/src/client/contract/draft-editor.ts
++++ b/packages/client/ui-conversation/src/client/contract/draft-editor.ts
+@@ -3,6 +3,7 @@ import type { LexicalEditor } from 'lexical'
+ import type { QuoteSummary } from '@deepseek-ai/dsh-client-ui-primitives'
+ import type { InputState } from './input.ts'
+ import type { InputSubmitMode } from './composer-submission.ts'
++import type { ComposerSendGesture } from '../send-gesture.ts'
+ 
+ /** Pick-time draft span guarded by the input revision. */
+ export interface TokenSpan {
+@@ -96,6 +97,8 @@ export interface ComposerKeyboard {
+   caretSpan(): EditSelection
+   /** Keyboard arbitration while the menu is open ('pass' when no pipeline). */
+   arbitrate(key: ArbitrateKey, composing: boolean): ArbitrateOutcome
++  /** Live Enter policy: which gesture submits; the complementary gesture breaks the line. */
++  sendGesture(): ComposerSendGesture
+   /** Space adjudication; true = the input applied a claim — caller preventDefaults. */
+   space(): boolean
+   /** Dismiss the popupSelect shell (any interaction outside the box). */
+diff --git a/packages/client/ui-conversation/src/client/conversation/assembly.ts b/packages/client/ui-conversation/src/client/conversation/assembly.ts
+index 233a72e23f..fdadd6044c 100644
+--- a/packages/client/ui-conversation/src/client/conversation/assembly.ts
++++ b/packages/client/ui-conversation/src/client/conversation/assembly.ts
+@@ -20,6 +20,7 @@ import type {
+ import { inspectRequestPrompt } from '../contract/request-inspection.ts'
+ import { inspectSystemPrompt, type SystemPromptState } from '../contract/system-prompt.ts'
+ import { ConversationNodeAssembler, ConversationUpdateError } from './assembler.ts'
++import { DEFAULT_COMPOSER_SEND_GESTURE, type ComposerSendGesture } from '../send-gesture.ts'
+ import { ConversationEventRegistry } from './event-registry.ts'
+ import { HistoricalImageCache } from './historical-images.ts'
+ import { ConversationViewRegistry } from './view-registry.ts'
+@@ -211,6 +212,12 @@ export class UiConversation extends Service {
+   readonly userText: UserTextRegistry
+   /** Plugin-owned handlers for selection and context-menu gestures. */
+   readonly interactions: ConversationInteractionRegistry
++  /**
++   * Live Enter policy shared by every Composer: the gesture that submits, its
++   * complement breaking the line. Standard until a profile plugin overrides it.
++   */
++  readonly composerSendGesture: SnapshotStore<ComposerSendGesture>
++    = createSnapshotStore(DEFAULT_COMPOSER_SEND_GESTURE)
+   private readonly bindings = new WeakMapWithValues<SessionBinding, BindingRecord>()
+   private readonly images: HistoricalImageCache
+ 
+@@ -251,6 +258,14 @@ export class UiConversation extends Service {
+     }, 'ui-conversation assembly')
+   }
+ 
++  /**
++   * Override the Enter policy every Composer reads on its next keydown.
++   * @param gesture - gesture that submits; the complementary gesture breaks the line.
++   */
++  setComposerSendGesture(gesture: ComposerSendGesture): void {
++    this.composerSendGesture.set(gesture)
++  }
++
+   /**
+    * Resolve the Conversation binding for one Controller binding or Session id.
+    * @param source - Session binding or identity.
+diff --git a/packages/client/ui-conversation/src/client/index.ts b/packages/client/ui-conversation/src/client/index.ts
+index 8a1b95e941..fa6a7b45ed 100644
+--- a/packages/client/ui-conversation/src/client/index.ts
++++ b/packages/client/ui-conversation/src/client/index.ts
+@@ -28,6 +28,7 @@ export { apply, Config, inject } from './apply.ts'
+ export type { Config as ConversationConfig } from './apply.ts'
+ export { UiConversation } from './conversation/assembly.ts'
+ export type { ConversationBinding } from './conversation/assembly.ts'
++export type { ComposerSendGesture } from './send-gesture.ts'
+ export type { ConversationGroupRegistry } from './conversation/group-registry.ts'
+ export type {
+   ConversationGroupContext, ConversationGroupData, ConversationGroupDataMap,
+diff --git a/packages/client/ui-conversation/src/client/input/editor/keymap.ts b/packages/client/ui-conversation/src/client/input/editor/keymap.ts
+index 8a3435d941..087995be30 100644
+--- a/packages/client/ui-conversation/src/client/input/editor/keymap.ts
++++ b/packages/client/ui-conversation/src/client/input/editor/keymap.ts
+@@ -3,8 +3,8 @@
+  * (arrows/escape/enter), space adjudication, the Enter submit gesture, and
+  * paste routing. Registered at CRITICAL priority so it decides before
+  * @lexical/plain-text's own Enter/paste defaults; a handler returning false
+- * falls through to those defaults (Shift+Enter's line break, ordinary
+- * spaces, text paste the bar routes itself).
++ * falls through to those defaults (the complementary Enter gesture's line
++ * break, ordinary spaces, text paste the bar routes itself).
+  *
+  * IME guard: a composition-closing Enter/Space must not submit or adjudicate.
+  * KeyboardEvent.isComposing covers most engines; Safari delivers the closing
+@@ -23,6 +23,7 @@ import {
+ } from 'lexical'
+ import { mergeRegister } from '@lexical/utils'
+ import type { ArbitrateKey, ArbitrateOutcome } from '../../contract/draft-editor.ts'
++import { DEFAULT_COMPOSER_SEND_GESTURE, type ComposerSendGesture } from '../../send-gesture.ts'
+ import { clipboardFiles } from '../file-intake.ts'
+ import { $isQuoteNode } from './QuoteNode.tsx'
+ 
+@@ -36,7 +37,7 @@ export interface ComposerKeymapHandlers {
+   dismissPopup(): void
+   /** Whether Enter may submit right now (locked/busy states refuse). */
+   canSubmit(): boolean
+-  /** Plain Enter submits; exactly Ctrl+Enter or Cmd+Enter selects accelerated delivery. */
++  /** Submit on the configured send gesture; exactly Ctrl+Enter or Cmd+Enter selects accelerated delivery. */
+   submit(accelerated: boolean): void
+   /**
+    * Pasted files with directory metadata supplied by the clipboard entry API.
+@@ -195,9 +196,14 @@ function moveToLineBoundary(editor: LexicalEditor, event: KeyboardEvent, recentl
+  * Register the composer keymap on one editor.
+  * @param editor - the shell-owned editor.
+  * @param handlers - bar-supplied behavior.
++ * @param sendGesture - live Enter policy: the gesture that submits, its complement breaking the line.
+  * @returns the unregister disposer.
+  */
+-export function registerComposerKeymap(editor: LexicalEditor, handlers: ComposerKeymapHandlers): () => void {
++export function registerComposerKeymap(
++  editor: LexicalEditor,
++  handlers: ComposerKeymapHandlers,
++  sendGesture: () => ComposerSendGesture = () => DEFAULT_COMPOSER_SEND_GESTURE,
++): () => void {
+   // Composition watch: true through composition and for one tick after
+   // compositionend (Safari's late closing keydown). The listener rides the
+   // root element and re-arms on root swaps.
+@@ -289,8 +295,13 @@ export function registerComposerKeymap(editor: LexicalEditor, handlers: Composer
+       // the DOM event that application shortcuts need.
+       if (event !== null && (event.altKey || event.getModifierState('AltGraph')
+         || (event.ctrlKey && event.metaKey) || (event.shiftKey && (event.ctrlKey || event.metaKey)))) return true
+-      // Plain Shift+Enter keeps its native line break, including during composition.
+-      if (event?.shiftKey === true) return false
++      // The configured submit gesture submits (Ctrl/Cmd+Enter always
++      // accelerates it); the complementary Enter gesture keeps its native line
++      // break, including during composition.
++      const accelerated = event?.ctrlKey === true || event?.metaKey === true
++      const submits = accelerated
++        || (event?.shiftKey === true) === (sendGesture() === 'shift-enter')
++      if (!submits) return false
+       if (event !== null && isComposingEvent(event, recentlyComposing)) {
+         // The IME consumes this Enter (candidate pick); neither submit nor
+         // break the line. No preventDefault: the browser owns the gesture.
+@@ -305,7 +316,7 @@ export function registerComposerKeymap(editor: LexicalEditor, handlers: Composer
+       event?.preventDefault()
+       if (event?.repeat === true) return true // held-down Enter must not machine-gun sends
+       if (!handlers.canSubmit()) return true
+-      handlers.submit(event?.ctrlKey === true || event?.metaKey === true)
++      handlers.submit(accelerated)
+       return true
+     }, COMMAND_PRIORITY_CRITICAL),
+     editor.registerCommand(PASTE_COMMAND, (event) => {
+diff --git a/packages/client/ui-conversation/src/client/input/editor/view-binding.ts b/packages/client/ui-conversation/src/client/input/editor/view-binding.ts
+index 9018592b8b..81798e2c01 100644
+--- a/packages/client/ui-conversation/src/client/input/editor/view-binding.ts
++++ b/packages/client/ui-conversation/src/client/input/editor/view-binding.ts
+@@ -162,7 +162,7 @@ export function installDraftKeymap(
+       if (gate.current.machineBusy || gate.current.locked) return
+       keyboard.paste(text)
+     },
+-  })
++  }, () => keyboard.sendGesture())
+ }
+ 
+ /**
+diff --git a/packages/client/ui-conversation/src/client/input/facade.ts b/packages/client/ui-conversation/src/client/input/facade.ts
+index 1fd208b6f7..2f81cb8713 100644
+--- a/packages/client/ui-conversation/src/client/input/facade.ts
++++ b/packages/client/ui-conversation/src/client/input/facade.ts
+@@ -24,6 +24,7 @@ import type {
+   ArbitrateKey, ArbitrateOutcome, ComposerKeyboard, DraftInput, DraftSnapshot, ReferenceInsert, TokenSpan,
+ } from '../contract/draft-editor.ts'
+ import type { InputSubmitMode, MessageSubmission, MessageSubmissionState } from '../contract/composer-submission.ts'
++import { DEFAULT_COMPOSER_SEND_GESTURE, type ComposerSendGesture } from '../send-gesture.ts'
+ import { serializeDraftPrompt } from './prompt.ts'
+ import { SubmitMachine } from './machine.ts'
+ import { resolveDraftInput, snapshotDraft } from '../draft.ts'
+@@ -73,6 +74,8 @@ export interface SessionInputDeps {
+   ): Promise<SubmitOutcome>
+   /** Live Session and composer-block policy for transcript insertion. */
+   quoteInsertionAllowed?: () => boolean
++  /** Live Enter policy override: which gesture submits; absent = plain Enter submits. */
++  sendGesture?: () => ComposerSendGesture
+   /** Current localized quote removal copy. */
+   quoteRemoveLabel?: () => string
+   /** Command-plane attachment plumbing (the hub owns the conversation face and the copy). */
+@@ -466,6 +469,14 @@ export class SessionInputShell implements SessionInput {
+     // update listener re-tracks at the settled caret on its own.
+   }
+ 
++  /**
++   * Live Enter policy for this composer.
++   * @returns the gesture that submits; the complementary gesture breaks the line.
++   */
++  sendGesture(): ComposerSendGesture {
++    return this.deps.sendGesture?.() ?? DEFAULT_COMPOSER_SEND_GESTURE
++  }
++
+   /** Dismiss the popupSelect shell (any interaction outside the box). */
+   dismissPopup(): void {
+     this.deps.popup?.()?.dismiss()
+diff --git a/packages/client/ui-conversation/src/client/input/hub.ts b/packages/client/ui-conversation/src/client/input/hub.ts
+index f6e9ce4183..348b6fb529 100644
+--- a/packages/client/ui-conversation/src/client/input/hub.ts
++++ b/packages/client/ui-conversation/src/client/input/hub.ts
+@@ -23,6 +23,7 @@ import type {
+ import type { ComposerKeyboard } from '../contract/draft-editor.ts'
+ import type { ComposerBlocks } from '../contract/composer-blocks.ts'
+ import type { InputSubmitMode } from '../contract/composer-submission.ts'
++import { DEFAULT_COMPOSER_SEND_GESTURE, type ComposerSendGesture } from '../send-gesture.ts'
+ import type { PopupDismissFace } from './facade.ts'
+ import { SessionInputShell } from './facade.ts'
+ import { reportMessageSubmission } from './submission-analytics.ts'
+@@ -61,10 +62,12 @@ export class InputHub implements SessionInputResolver {
+   /**
+    * @param ctx - client root context (services resolved lazily per call — boot order stays free).
+    * @param t - conversation-namespace translate thunk (reads the active locale at call time).
++   * @param sendGesture - live Enter policy shared by every shell; standard when omitted.
+    */
+   constructor(
+     private readonly rootCtx: Context,
+     private readonly t: TranslateNS<'conversation'>,
++    private readonly sendGesture: () => ComposerSendGesture = () => DEFAULT_COMPOSER_SEND_GESTURE,
+   ) {}
+ 
+   /**
+@@ -124,6 +127,7 @@ export class InputHub implements SessionInputResolver {
+       messageSubmitted: (submission) => { reportMessageSubmission(this.rootCtx, submission) },
+       inputTriggers: () => this.controller(actx),
+       popup: () => this.popup(actx),
++      sendGesture: () => this.sendGesture(),
+       inbox: session.projections.faceOf('inbox') as ObservableSnapshot<InboxState | undefined>,
+       defaultSink: (text, attachmentIds, mode, signal, accept) => this.sink(session, text, attachmentIds, mode, signal, accept),
+       quoteRemoveLabel: () => this.t('quote.remove'),
+diff --git a/packages/client/ui-conversation/src/client/send-gesture.ts b/packages/client/ui-conversation/src/client/send-gesture.ts
+new file mode 100644
+index 0000000000..3cc1543406
+--- /dev/null
++++ b/packages/client/ui-conversation/src/client/send-gesture.ts
+@@ -0,0 +1,11 @@
++/**
++ * Composer Enter policy shared by the keymap and the shortcut reference. The
++ * standard policy submits on plain Enter; a profile plugin may instead make
++ * Shift+Enter submit, leaving plain Enter to break the line.
++ */
++
++/** Enter gesture that submits a draft; the complementary gesture breaks the line. */
++export type ComposerSendGesture = 'enter' | 'shift-enter'
++
++/** Standard policy: plain Enter submits, Shift+Enter breaks the line. */
++export const DEFAULT_COMPOSER_SEND_GESTURE: ComposerSendGesture = 'enter'
+diff --git a/packages/client/ui-conversation/tests/draft-hub.client.spec.ts b/packages/client/ui-conversation/tests/draft-hub.client.spec.ts
+index e1c1b5e3fe..776aaa05fb 100644
+--- a/packages/client/ui-conversation/tests/draft-hub.client.spec.ts
++++ b/packages/client/ui-conversation/tests/draft-hub.client.spec.ts
+@@ -14,6 +14,7 @@ import { ReferenceChipNode } from '../src/client/input/editor/chip-node.tsx'
+ import { TextRefNode } from '../src/client/input/editor/text-ref.ts'
+ import { SessionInputShell } from '../src/client/input/facade.ts'
+ import { InputHub } from '../src/client/input/hub.ts'
++import type { ComposerSendGesture } from '../src/client/send-gesture.ts'
+ import { zh } from '../src/client/locales.ts'
+ import { brandString } from '@deepseek-ai/dsh-brand'
+ 
+@@ -309,3 +310,14 @@ it('unsubscribes the lexicon and refuses the old binding after Session disposal'
+   expect(b.shell.requestDraftInitialization({ prompt: 'late edit', clearPreviousDraft: true })).toBe('blocked')
+   expect(() => b.hub.requestDraftInitialization(b.binding, { prompt: 'late edit' })).toThrow('retained Session binding')
+ })
++
++it('serves the live hub Enter policy through every shell', async () => {
++  const b = await storedSession(undefined)
++  expect(b.hub.shellFor(b.binding).sendGesture()).toBe('enter')
++  let gesture: ComposerSendGesture = 'enter'
++  const overridden = new InputHub(b.ctx, makeTranslate(zh, {}), () => gesture)
++  const shell = overridden.shellFor(b.binding)
++  expect(shell.sendGesture()).toBe('enter')
++  gesture = 'shift-enter'
++  expect(shell.sendGesture()).toBe('shift-enter')
++})
+diff --git a/packages/client/ui-conversation/tests/keymap-routing.client.spec.tsx b/packages/client/ui-conversation/tests/keymap-routing.client.spec.tsx
+index 66008b4c7b..25718912b5 100644
+--- a/packages/client/ui-conversation/tests/keymap-routing.client.spec.tsx
++++ b/packages/client/ui-conversation/tests/keymap-routing.client.spec.tsx
+@@ -11,6 +11,7 @@ import { $createParagraphNode, $createTextNode, $getRoot, $getSelection, $isRang
+ import { registerPlainText } from '@lexical/plain-text'
+ import { registerComposerKeymap } from '../src/client/input/editor/keymap.ts'
+ import { $createQuoteNode, QuoteNode } from '../src/client/input/editor/QuoteNode.tsx'
++import type { ComposerSendGesture } from '../src/client/send-gesture.ts'
+ 
+ describe('keymap keydown routing', () => {
+   it('clears composition presentation on root swaps and unregisters pending callbacks', async () => {
+@@ -69,6 +70,69 @@ describe('keymap keydown routing', () => {
+     expect(submit).toHaveBeenCalledWith(true)
+   })
+ 
++  it('follows a live Shift+Enter policy: plain Enter breaks the line, Shift+Enter submits', async () => {
++    const editor = createEditor({ namespace: 'keymap-send-gesture', onError: (e) => { throw e } })
++    const root = document.createElement('div')
++    root.contentEditable = 'true'
++    document.body.appendChild(root)
++    onTestFinished(() => { editor.setRootElement(null); root.remove() })
++    editor.setRootElement(root)
++    onTestFinished(registerPlainText(editor))
++    const submit = vi.fn()
++    let gesture: ComposerSendGesture = 'enter'
++    onTestFinished(registerComposerKeymap(editor, {
++      arbitrate: () => 'pass', space: () => false, dismissPopup: () => {},
++      canSubmit: () => true, submit, intakeFiles: () => {}, pasteText: () => {},
++    }, () => gesture))
++    editor.update(() => {
++      const paragraph = $createParagraphNode().append($createTextNode('first line'))
++      $getRoot().append(paragraph)
++      paragraph.selectEnd()
++    }, { discrete: true })
++
++    // Standard policy: the same keydown submits.
++    fireEvent.keyDown(root, { key: 'Enter' })
++    expect(submit).toHaveBeenCalledWith(false)
++
++    // The policy is read on every keydown, so a plugin switch takes effect
++    // without re-registering the keymap.
++    gesture = 'shift-enter'
++    const lineBreak = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
++    root.dispatchEvent(lineBreak)
++    expect(submit).toHaveBeenCalledTimes(1)
++    // Lexical's own plain-text Enter handler breaks the line instead.
++    await vi.waitFor(() => {
++      expect(editor.getEditorState().read(() => $getRoot().getTextContent())).toBe('first line\n')
++    })
++    fireEvent.keyDown(root, { key: 'Enter', shiftKey: true })
++    expect(submit).toHaveBeenCalledTimes(2)
++    expect(submit).toHaveBeenLastCalledWith(false)
++    // Accelerated delivery still rides Ctrl/Cmd+Enter.
++    fireEvent.keyDown(root, { key: 'Enter', ctrlKey: true })
++    expect(submit).toHaveBeenLastCalledWith(true)
++  })
++
++  it('never submits on the Shift+Enter send gesture while an IME composition owns the keydown', () => {
++    const editor = createEditor({ namespace: 'keymap-send-gesture-ime', onError: (e) => { throw e } })
++    const root = document.createElement('div')
++    root.contentEditable = 'true'
++    document.body.appendChild(root)
++    onTestFinished(() => { editor.setRootElement(null); root.remove() })
++    editor.setRootElement(root)
++    onTestFinished(registerPlainText(editor))
++    const submit = vi.fn()
++    onTestFinished(registerComposerKeymap(editor, {
++      arbitrate: () => 'pass', space: () => false, dismissPopup: () => {},
++      canSubmit: () => true, submit, intakeFiles: () => {}, pasteText: () => {},
++    }, () => 'shift-enter'))
++
++    fireEvent.compositionStart(root)
++    const closing = new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, bubbles: true, cancelable: true })
++    root.dispatchEvent(closing)
++    expect(submit).not.toHaveBeenCalled()
++    expect(closing.defaultPrevented).toBe(false)
++  })
++
+   it.each([
+     { altKey: true },
+     { altKey: true, metaKey: true },

@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Shift+Enter 发送",
+    "description": "让 Web 界面每个会话的输入框改用 Shift+Enter 发送、Enter 换行，避免误按一次 Enter 就把消息发出去。需要本仓库附带的 DSH 补丁；没有补丁时保持默认键位，本插件不生效。",
+    "detail": "docs/DETAIL.md"
+  }
+}
